@@ -21,7 +21,7 @@ char IOmap[4096];
 ec_ODlistt ODlist;
 ec_OElistt OElist;
 boolean printSDO = FALSE;
-boolean printMAP = FALSE;
+boolean printMAP = TRUE;
 char usdo[128];
 char hstr[1024];
 
@@ -644,7 +644,8 @@ int main(int argc, char *argv[])
    printf("End program\n");
 
 #else
-       char ifbuf[1024] = "\\Device\\NPF_{2C4C20D3-EBAA-4C1F-B7B0-E0C399EA0CDA}";
+       //\\Device\\NPF_{2C4C20D3-EBAA-4C1F-B7B0-E0C399EA0CDA
+       char ifbuf[1024] = "\\Device\\NPF_{6516F204-048F-46E5-968C-C7E4E331A1EB}";
        slaveinfo(ifbuf);
 #endif
    return (0);
