@@ -20,7 +20,7 @@
 char IOmap[4096];
 ec_ODlistt ODlist;
 ec_OElistt OElist;
-boolean printSDO = FALSE;
+boolean printSDO = TRUE;
 boolean printMAP = TRUE;
 char usdo[128];
 char hstr[1024];
@@ -619,7 +619,7 @@ int slaveinfo(char *ifname)
 int main(int argc, char *argv[])
 {
        printf("SOEM (Simple Open EtherCAT Master)\nSlaveinfo\n");
-#if 0     
+#if 0    
        char ifbuf[1024];
        ec_adaptert* adapter = NULL;
        adapter = ec_find_adapters();
@@ -645,7 +645,8 @@ int main(int argc, char *argv[])
 
 #else
        //\\Device\\NPF_{2C4C20D3-EBAA-4C1F-B7B0-E0C399EA0CDA
-       char ifbuf[1024] = "\\Device\\NPF_{6516F204-048F-46E5-968C-C7E4E331A1EB}";
+       //"\\Device\\NPF_{6516F204-048F-46E5-968C-C7E4E331A1EB}" MSI
+       char ifbuf[1024] = "\\Device\\NPF_{2C4C20D3-EBAA-4C1F-B7B0-E0C399EA0CDA}";
        slaveinfo(ifbuf);
 #endif
    return (0);

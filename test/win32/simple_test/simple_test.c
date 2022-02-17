@@ -38,14 +38,14 @@ void CALLBACK RTthread(UINT uTimerID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dw1
     /* do RT control stuff here */
 }
 
-int EL7031setup(uint16 slave)
+int EPOS4setup(uint16 slave) 
 {
     int retval;
     uint16 u16val;
 
     // map velocity
-    uint16 map_1c12[4] = {0x0003, 0x1601, 0x1602, 0x1604};
-    uint16 map_1c13[3] = {0x0002, 0x1a01, 0x1a03};
+    uint16 map_1c12[4] = { 0x0003, 0x1601, 0x1602, 0x1604 };
+    uint16 map_1c13[3] = { 0x0002, 0x1a01, 0x1a03 };
 
     retval = 0;
 
@@ -67,6 +67,39 @@ int EL7031setup(uint16 slave)
     // set other nescessary parameters as needed
     // .....
 
+    while (EcatError) printf("%s", ec_elist2string());
+
+    printf("EL7031 slave %d set, retval = %d\n", slave, retval);
+    return 1;
+}
+
+int EL7031setup(uint16 slave)
+{
+    int retval;
+    uint16 u16val;
+    uint8 u8val;
+
+    retval = 0;
+    u8val = 0;
+    retval += ec_SDOwrite(slave, 0x1c12, 0x00, FALSE, sizeof(u8val), &u8val, EC_TIMEOUTRXM);
+    u16val = 0x1600;
+    retval += ec_SDOwrite(slave, 0x1c12, 0x01, FALSE, sizeof(u16val), &u16val, EC_TIMEOUTRXM);
+
+    u8val = 0;
+    retval += ec_SDOwrite(slave, 0x1c13, 0x00, FALSE, sizeof(u8val), &u8val, EC_TIMEOUTRXM);
+    u16val = 0x1a00;
+    retval += ec_SDOwrite(slave, 0x1c13, 0x01, FALSE, sizeof(u16val), &u16val, EC_TIMEOUTRXM);
+
+    u8val = 8;
+    retval += ec_SDOwrite(slave, 0x6060, 0x00, FALSE, sizeof(u8val), &u8val, EC_TIMEOUTRXM);
+
+    // set some motor parameters, just as example
+    u16val = 1200; // max motor current in mA
+//    retval += ec_SDOwrite(slave, 0x8010, 0x01, FALSE, sizeof(u16val), &u16val, EC_TIMEOUTSAFE);
+    u16val = 150; // motor coil resistance in 0.01ohm
+//    retval += ec_SDOwrite(slave, 0x8010, 0x04, FALSE, sizeof(u16val), &u16val, EC_TIMEOUTSAFE);
+
+
     while(EcatError) printf("%s", ec_elist2string());
 
     printf("EL7031 slave %d set, retval = %d\n", slave, retval);
@@ -83,17 +116,13 @@ int AEPsetup(uint16 slave)
 
     u8val = 0;
     retval += ec_SDOwrite(slave, 0x1c12, 0x00, FALSE, sizeof(u8val), &u8val, EC_TIMEOUTRXM);
-    u16val = 0x1603;
+    u16val = 0x1600;
     retval += ec_SDOwrite(slave, 0x1c12, 0x01, FALSE, sizeof(u16val), &u16val, EC_TIMEOUTRXM);
-    u8val = 1;
-    retval += ec_SDOwrite(slave, 0x1c12, 0x00, FALSE, sizeof(u8val), &u8val, EC_TIMEOUTRXM);
 
     u8val = 0;
     retval += ec_SDOwrite(slave, 0x1c13, 0x00, FALSE, sizeof(u8val), &u8val, EC_TIMEOUTRXM);
-    u16val = 0x1a03;
+    u16val = 0x1a00;
     retval += ec_SDOwrite(slave, 0x1c13, 0x01, FALSE, sizeof(u16val), &u16val, EC_TIMEOUTRXM);
-    u8val = 1;
-    retval += ec_SDOwrite(slave, 0x1c13, 0x00, FALSE, sizeof(u8val), &u8val, EC_TIMEOUTRXM);
 
     u8val = 8;
     retval += ec_SDOwrite(slave, 0x6060, 0x00, FALSE, sizeof(u8val), &u8val, EC_TIMEOUTRXM);
@@ -134,23 +163,16 @@ void simpletest(char *ifname)
        {
          printf("%d slaves found and configured.\n",ec_slavecount);
 
-         if((ec_slavecount > 1))
+         if((ec_slavecount >= 1))
          {
              for(slc = 1; slc <= ec_slavecount; slc++)
              {
                  // beckhoff EL7031, using ec_slave[].name is not very reliable
-                 if((ec_slave[slc].eep_man == 0x00000002) && (ec_slave[slc].eep_id == 0x1b773052))
-                 {
+                 if(TRUE)
+                 {  
                      printf("Found %s at position %d\n", ec_slave[slc].name, slc);
                      // link slave specific setup to preop->safeop hook
                      ec_slave[slc].PO2SOconfig = &EL7031setup;
-                 }
-                 // Copley Controls EAP, using ec_slave[].name is not very reliable
-                 if((ec_slave[slc].eep_man == 0x000000ab) && (ec_slave[slc].eep_id == 0x00000380))
-                 {
-                     printf("Found %s at position %d\n", ec_slave[slc].name, slc);
-                     // link slave specific setup to preop->safeop hook
-                     ec_slave[slc].PO2SOconfig = &AEPsetup;
                  }
              }
          }
@@ -190,7 +212,7 @@ void simpletest(char *ifname)
          /* wait for all slaves to reach OP state */
          do
          {
-            ec_statecheck(0, EC_STATE_OPERATIONAL, 50000);
+            ec_statecheck(0, EC_STATE_OPERATIONAL, 5000);
          }
          while (chk-- && (ec_slave[0].state != EC_STATE_OPERATIONAL));
          if (ec_slave[0].state == EC_STATE_OPERATIONAL )
@@ -340,33 +362,16 @@ OSAL_THREAD_FUNC ecatcheck(void *lpParam)
     return ;
 }
 
-char ifbuf[1024];
 
 int main(int argc, char *argv[])
 {
-   ec_adaptert * adapter = NULL;
-   printf("SOEM (Simple Open EtherCAT Master)\nSimple test\n");
+    char ifbuf[1024] = "\\Device\\NPF_{2C4C20D3-EBAA-4C1F-B7B0-E0C399EA0CDA}";
 
-   if (argc > 1)
-   {
+      printf("SOEM (Simple Open EtherCAT Master)\nSimple test\n");
       /* create thread to handle slave error handling in OP */
       osal_thread_create(&thread1, 128000, &ecatcheck, (void*) &ctime);
-      strcpy(ifbuf, argv[1]);
       /* start cyclic part */
       simpletest(ifbuf);
-   }
-   else
-   {
-      printf("Usage: simple_test ifname1\n");
-   	/* Print the list */
-      printf ("Available adapters\n");
-      adapter = ec_find_adapters ();
-      while (adapter != NULL)
-      {
-         printf ("Description : %s, Device to use for wpcap: %s\n", adapter->desc,adapter->name);
-         adapter = adapter->next;
-      }
-   }
 
    printf("End program\n");
    return (0);
