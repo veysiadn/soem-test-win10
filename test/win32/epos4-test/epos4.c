@@ -4,21 +4,42 @@
 #include <math.h>
 
 #include "ethercat.h"
-
+#include "osal_win32.h"
 #define NSEC_PER_SEC 1000000000
 #define MSEC_PER_SEC 1000
 #define EC_TIMEOUTMON 500
-#define DC_CYCLE_TIME 1000000 //deadline in ns
-#define RUNTIME 800000 //runtime assicurato in ns
+#define DC_CYCLE_TIME 2000000 //deadline in ns
+#define CYCLE_TIME 2000
 #define EPOS4 1 
 #define DC_SYNC_SHIFT DC_CYCLE_TIME/2
 #define PI 3.141592654
-#define SAMPLES 20000
+#define NUM_OF_SAMPLES 60000
 #define STEP 0.00005
-#define AMPLITUDE 60
+#define AMPLITUDE 100
 #define TRESHOLD 50
 
-//Stati EPOS state machine
+#define TIMER_ADD(a, b, result)                                               \
+  do {                                                                        \
+    (result)->sec = (a)->sec + (b)->sec;                             \
+    (result)->usec = (a)->usec + (b)->usec;                          \
+    if ((result)->usec >= 1000000)                                         \
+      {                                                                       \
+        ++(result)->sec;                                                   \
+        (result)->usec -= 1000000;                                         \
+      }                                                                       \
+  } while (0)
+
+#define TIMER_SUB(a, b, result)                                               \
+  do {                                                                        \
+    (result)->sec = (a)->sec - (b)->sec;                             \
+    (result)->usec = (a)->usec - (b)->usec;                          \
+    if ((result)->usec < 0) {                                              \
+      --(result)->sec;                                                     \
+      (result)->usec += 1000000;                                           \
+    }                                                                         \
+  } while (0)
+
+//Statusword EPOS state machine
 #define SWITCH_ON_DISABLED 0x40 
 #define READY_TO_SWITCH_ON 0x21
 #define SWITCHED_ON 0x23
@@ -27,7 +48,7 @@
 #define FAULT_REACTION_ACTIVE 0x1f
 #define FAULT 0X8
 
-//Comandi EPOS state machine
+//Controlword EPOS state machine
 #define SHUTDOWN 0X6
 #define SWITCH_ON 0x7
 #define SWITCH_ON_ENABLE 0xF
@@ -42,13 +63,13 @@
 #define ONE_TURN_TO_DEGREE 360
 
 #define stack8k (8 * 1024)
+#define stack64k (64 * 1024)
 
-//rappresenta un incremento in gradi 
-const double g_IncPerRotation = ((double)ONE_TURN_TO_DEGREE / ((double)ENCODER_RESOLUTION * (double)GEAR_REDUCTION));
-
+const double g_RotationToIncConstant = ((double)ONE_TURN_TO_DEGREE / ((double)ENCODER_RESOLUTION * (double)GEAR_REDUCTION));
+const int	g_IncPerRotation = 4 * GEAR_REDUCTION * ENCODER_RESOLUTION;
 char IOmap[4096];
-OSAL_THREAD_HANDLE thread1, thread2, thread3;
-int dorun = 0;
+OSAL_THREAD_HANDLE thread_ecat, thread_ecatcheck, thread_csptest;
+int dorun = 1;
 //int deltat, tmax = 0;
 int64 toff, gl_delta;
 int expectedWKC;
@@ -59,17 +80,17 @@ boolean needlf;
 volatile int wkc;
 boolean inOP;
 uint8 currentgroup = 0;
-//posizione desiderata in incrementi
-int32 target_position_abs[SAMPLES + 100];
+// Save vals to arrays
+int32 target_position_abs[NUM_OF_SAMPLES + 100];
 int32 position_offset;
-int actual_position_vals[SAMPLES + 100];
-int actaul_current_vals[SAMPLES + 100];
-int current_rpm_vals[SAMPLES + 100];
-int actual_torque_vals[SAMPLES + 100];
-int64 tv[SAMPLES + 100];
-int64 cycles[SAMPLES + 100];
-int i = 2000;
-int check;
+int actual_position_vals[NUM_OF_SAMPLES + 100];
+int actaul_current_vals[NUM_OF_SAMPLES + 100];
+int current_rpm_vals[NUM_OF_SAMPLES + 100];
+int actual_torque_vals[NUM_OF_SAMPLES + 100];
+int64 tv[NUM_OF_SAMPLES + 100];
+int64 cycles[NUM_OF_SAMPLES + 100];
+int counter = 2000;
+int check = 0 ;
 int shutdown_ = 1;
 
 /* INIT = synchronization and opening of the mailbox
@@ -114,7 +135,7 @@ in_EPOSt* in_EPOS;
 // degree to encoder increment conversion
 int deg_to_inc(double deg) {
 
-	int32 temp = (int32)(deg / g_IncPerRotation);
+	int32 temp = (int32)(deg / g_RotationToIncConstant);
 	return temp;
 
 }
@@ -122,7 +143,7 @@ int deg_to_inc(double deg) {
 // encdoder increment to degree conversion
 double inc_to_deg(int inc) {
 
-	double temp = ((double)inc * g_IncPerRotation);
+	double temp = ((double)inc * g_RotationToIncConstant);
 	return temp;
 
 }
@@ -254,27 +275,28 @@ void CSP_PDO_mapping(uint16 slave) {
 
 }
 
-//funzione che esegue il setup dei parametri e chiama quella per la mappatura
+// Setup configuration parameters for EPOS4
 int CSP_EPOSsetup(uint16 slave) {
 
 	OBentry mode = { 0x6060, 0x00, sizeof(int8_t),(int8_t)8 }; //modalità di funzionamento 8=CSP
-	OBentry period = { 0x60C2, 0x01, sizeof(uint8),(uint8)1 }; //periodo di interpolazione in ms
-	OBentry nominal_current = { 0x3001, 0x01, sizeof(uint32),(uint32)1500 }; //corrente nominale in mA
-	OBentry max_current = { 0x3001, 0x02, sizeof(uint32),(uint32)(2 * nominal_current.value) }; //corrente massima del motore in mA 
-	OBentry thermal_time_constant_winding = { 0x3001, 0x04, sizeof(uint16),(uint16)33 }; //costante di tempo termica di avvolgimento in 0.1s
-	OBentry torque_costant = { 0x3001, 0x05, sizeof(uint32),(uint32)24300 }; //costante di coppia in uNm/A
-	OBentry following_error_window = { 0x6065, 0x00, sizeof(uint32),(uint32)10e6 };
-	//scostamento max tra riferimento e posizione attuale
-	OBentry actual_position = { 0x6064, 0x00, sizeof(int32),(int32)0 };
+	OBentry period = { 0x60C2, 0x01, sizeof(uint8),(uint8)4 }; //periodo di interpolazione in ms
+    OBentry profile_vel = { 0x6081,0x00, sizeof(int32_t),(uint32_t)750 };
 
-	//parametri da settare
-	int8_t mode_prova;
-	uint8 period_prova;
-	uint32 nominal_current_prova;
-	uint32 max_current_prova;
-	uint16 thermal_time_constant_winding_prova;
-	uint16 torque_costant_prova;
-	uint32 following_error_window_prova;
+//	OBentry nominal_current = { 0x3001, 0x01, sizeof(uint32),(uint32)2000 }; //corrente nominale in mA
+//	OBentry max_current = { 0x3001, 0x02, sizeof(uint32),(uint32)(nominal_current.value) }; //corrente massima del motore in mA
+//	OBentry thermal_time_constant_winding = { 0x3001, 0x04, sizeof(uint16),(uint16)440 }; //costante di tempo termica di avvolgimento in 0.1s
+//	OBentry torque_costant = { 0x3001, 0x05, sizeof(uint32),(uint32)58500 }; //costante di coppia in uNm/A
+//	OBentry following_error_window = { 0x6065, 0x00, sizeof(uint32),(uint32)1e6 };
+//	//scostamento max tra riferimento e posizione attuale
+//	OBentry actual_position = { 0x6064, 0x00, sizeof(int32),(int32)0 };
+//	//parametri da settare
+//	int8_t mode_prova;
+//	uint8 period_prova;
+//	uint32 nominal_current_prova;
+//	uint32 max_current_prova;
+//	uint16 thermal_time_constant_winding_prova;
+//	uint16 torque_costant_prova;
+//	uint32 following_error_window_prova;
 
 	/* non settabili o corretti di default
 	int32_t position_offset_prova;
@@ -288,65 +310,66 @@ int CSP_EPOSsetup(uint16 slave) {
 	int retval;
 	/*int length32=sizeof(uint32);
 	int length16=sizeof(int16_t);*/
+    retval = ec_SDOwrite(slave, mode.index, mode.sub_index, FALSE, mode.size, &(mode.value), EC_TIMEOUTSAFE);
+    printf("%d\n", retval);
+    retval = ec_SDOwrite(slave, period.index, period.sub_index, FALSE, sizeof(uint8), &(period.value), EC_TIMEOUTSAFE);
+    printf("%d\n", retval);
 
-	/* SETUP dei valori di default*/
-	retval = ec_SDOwrite(slave, nominal_current.index, nominal_current.sub_index, FALSE, sizeof(uint32), &(nominal_current.value),
-		EC_TIMEOUTSAFE);
+	retval = ec_SDOwrite(slave, profile_vel.index, profile_vel.sub_index, FALSE, sizeof(int32_t), &(profile_vel.value), EC_TIMEOUTSAFE);
 	printf("%d\n", retval);
 
-	retval = ec_SDOwrite(slave, max_current.index, max_current.sub_index, FALSE, sizeof(uint32), &(max_current.value), EC_TIMEOUTSAFE);
-	printf("%d\n", retval);
+//	retval = ec_SDOwrite(slave, nominal_current.index, nominal_current.sub_index, FALSE, sizeof(uint32), &(nominal_current.value),
+//		EC_TIMEOUTSAFE);
+//	printf("%d\n", retval);
 
-	retval = ec_SDOwrite(slave, thermal_time_constant_winding.index, thermal_time_constant_winding.sub_index, FALSE, sizeof(uint16),
-		&(thermal_time_constant_winding.value), EC_TIMEOUTSAFE);
-	printf("%d\n", retval);
+//	retval = ec_SDOwrite(slave, max_current.index, max_current.sub_index, FALSE, sizeof(uint32), &(max_current.value), EC_TIMEOUTSAFE);
+//	printf("%d\n", retval);
 
-	retval = ec_SDOwrite(slave, torque_costant.index, torque_costant.sub_index, FALSE, sizeof(uint32), &(torque_costant.value),
-		EC_TIMEOUTSAFE);
-	printf("%d\n", retval);
+//	retval = ec_SDOwrite(slave, thermal_time_constant_winding.index, thermal_time_constant_winding.sub_index, FALSE, sizeof(uint16),
+//		&(thermal_time_constant_winding.value), EC_TIMEOUTSAFE);
+//	printf("%d\n", retval);
 
-	/* SETUP degli oggetti relativi alla modalità CSP */
-	retval = ec_SDOwrite(slave, mode.index, mode.sub_index, FALSE, mode.size, &(mode.value), EC_TIMEOUTSAFE);
-	printf("%d\n", retval);
+//	retval = ec_SDOwrite(slave, torque_costant.index, torque_costant.sub_index, FALSE, sizeof(uint32), &(torque_costant.value),
+//		EC_TIMEOUTSAFE);
+//	printf("%d\n", retval);
 
-	retval = ec_SDOwrite(slave, period.index, period.sub_index, FALSE, sizeof(uint8), &(period.value), EC_TIMEOUTSAFE);
-	printf("%d\n", retval);
+//	/* SETUP degli oggetti relativi alla modalità CSP */
 
-	retval = ec_SDOwrite(slave, following_error_window.index, following_error_window.sub_index, FALSE,
-		sizeof(uint32), &(following_error_window.value), EC_TIMEOUTSAFE);
-	printf("%d\n", retval);
+//	retval = ec_SDOwrite(slave, following_error_window.index, following_error_window.sub_index, FALSE,
+//		sizeof(uint32), &(following_error_window.value), EC_TIMEOUTSAFE);
+//	printf("%d\n", retval);
 
-	//controllo che i parametri siano impostati correttamente
-	retval = ec_SDOread(slave, 0x6061, mode.sub_index, FALSE, &(mode.size), &mode_prova, EC_TIMEOUTSAFE);
-	printf("mode=%d,letti=%d,esito=%d\n", mode_prova, mode.size, retval);
+//	//controllo che i parametri siano impostati correttamente
+//	retval = ec_SDOread(slave, 0x6061, mode.sub_index, FALSE, &(mode.size), &mode_prova, EC_TIMEOUTSAFE);
+//	printf("mode=%d,letti=%d,esito=%d\n", mode_prova, mode.size, retval);
 
-	retval = ec_SDOread(slave, period.index, period.sub_index, FALSE, &(period.size), &period_prova, EC_TIMEOUTSAFE);
-	printf("period=%u,letti=%d,esito=%d\n", period_prova, period.size, retval);
+//	retval = ec_SDOread(slave, period.index, period.sub_index, FALSE, &(period.size), &period_prova, EC_TIMEOUTSAFE);
+//	printf("period=%u,letti=%d,esito=%d\n", period_prova, period.size, retval);
 
-	retval = ec_SDOread(slave, nominal_current.index, nominal_current.sub_index, FALSE, &(nominal_current.size),
-		&nominal_current_prova, EC_TIMEOUTSAFE);
-	printf("nominal_current=%u,letti=%d, esito=%d\n", nominal_current_prova, nominal_current.size, retval);
+//	retval = ec_SDOread(slave, nominal_current.index, nominal_current.sub_index, FALSE, &(nominal_current.size),
+//		&nominal_current_prova, EC_TIMEOUTSAFE);
+//	printf("nominal_current=%u,letti=%d, esito=%d\n", nominal_current_prova, nominal_current.size, retval);
 
-	retval = ec_SDOread(slave, max_current.index, max_current.sub_index, FALSE, &(max_current.size),
-		&max_current_prova, EC_TIMEOUTSAFE);
-	printf("max_current=%u,letti=%d, esito=%d\n", max_current_prova, max_current.size, retval);
+//	retval = ec_SDOread(slave, max_current.index, max_current.sub_index, FALSE, &(max_current.size),
+//		&max_current_prova, EC_TIMEOUTSAFE);
+//	printf("max_current=%u,letti=%d, esito=%d\n", max_current_prova, max_current.size, retval);
 
-	retval = ec_SDOread(slave, thermal_time_constant_winding.index, thermal_time_constant_winding.sub_index,
-		FALSE, &(thermal_time_constant_winding.size), &thermal_time_constant_winding_prova, EC_TIMEOUTSAFE);
-	printf("thermal_time_constant_winding=%u,letti=%d, esito=%d\n", thermal_time_constant_winding_prova,
-		thermal_time_constant_winding.size, retval);
+//	retval = ec_SDOread(slave, thermal_time_constant_winding.index, thermal_time_constant_winding.sub_index,
+//		FALSE, &(thermal_time_constant_winding.size), &thermal_time_constant_winding_prova, EC_TIMEOUTSAFE);
+//	printf("thermal_time_constant_winding=%u,letti=%d, esito=%d\n", thermal_time_constant_winding_prova,
+//		thermal_time_constant_winding.size, retval);
 
-	retval = ec_SDOread(slave, torque_costant.index, torque_costant.sub_index, FALSE, &(torque_costant.size),
-		&torque_costant_prova, EC_TIMEOUTSAFE);
-	printf("torque_costant=%u,letti=%d, esito=%d\n", torque_costant_prova, torque_costant.size, retval);
+//	retval = ec_SDOread(slave, torque_costant.index, torque_costant.sub_index, FALSE, &(torque_costant.size),
+//		&torque_costant_prova, EC_TIMEOUTSAFE);
+//	printf("torque_costant=%u,letti=%d, esito=%d\n", torque_costant_prova, torque_costant.size, retval);
 
-	retval = ec_SDOread(slave, following_error_window.index, following_error_window.sub_index,
-		FALSE, &(following_error_window.size), &following_error_window_prova, EC_TIMEOUTSAFE);
-	printf("errore=%d,letti=%d,esito=%d\n", following_error_window_prova, following_error_window.size, retval);
+//	retval = ec_SDOread(slave, following_error_window.index, following_error_window.sub_index,
+//		FALSE, &(following_error_window.size), &following_error_window_prova, EC_TIMEOUTSAFE);
+//	printf("errore=%d,letti=%d,esito=%d\n", following_error_window_prova, following_error_window.size, retval);
 
-	retval = ec_SDOread(slave, actual_position.index, actual_position.sub_index,
-		FALSE, &(actual_position.size), &position_offset, EC_TIMEOUTSAFE);
-	printf("offset=%d,letti=%d,esito=%d\n", position_offset, actual_position.size, retval);
+//	retval = ec_SDOread(slave, actual_position.index, actual_position.sub_index,
+//		FALSE, &(actual_position.size), &position_offset, EC_TIMEOUTSAFE);
+//	printf("offset=%d,letti=%d,esito=%d\n", position_offset, actual_position.size, retval);
 
 	/*retval=ec_SDOread(slave, 0x3000, 0x05, FALSE, &length32, &main_sensor_resolution_prova, EC_TIMEOUTSAFE);
 	printf("risoluzione=%u,letti=%d, esito=%d\n",main_sensor_resolution_prova,length32,retval);
@@ -375,7 +398,7 @@ int CSP_EPOSsetup(uint16 slave) {
 
 }
 
-//macchina a stati per Cia 402, parte di motion control
+// CiA402 State machine control function
 int Servo_state_machine(int flag) {
 
 	switch (in_EPOS->statusword & 0xff) {
@@ -457,17 +480,17 @@ int Servo_state_machine(int flag) {
 //
 //	nsec = addtime % NSEC_PER_SEC;
 //	sec = (addtime - nsec) / NSEC_PER_SEC;
-//	ts->tv_sec += sec;
+//	ts->sec += sec;
 //	ts->tv_nsec += nsec;
 //	if (ts->tv_nsec > NSEC_PER_SEC)
 //	{
 //		nsec = ts->tv_nsec % NSEC_PER_SEC;
-//		ts->tv_sec += (ts->tv_nsec - nsec) / NSEC_PER_SEC;
+//		ts->sec += (ts->tv_nsec - nsec) / NSEC_PER_SEC;
 //		ts->tv_nsec = nsec;
 //	}
 //}
 
-//sincronizzazione del clock del master e della rete
+// synchronization of the clock of the master and the network
 void ec_sync(int64 reftime, int64 cycletime, int64* offsettime) {
 	static int64 integral = 0;
 	int64 delta;
@@ -484,122 +507,128 @@ void ec_sync(int64 reftime, int64 cycletime, int64* offsettime) {
 OSAL_THREAD_FUNC ecatthread() {
 	struct timespec ts = {0}; 
 	struct timespec tleft = {0};
-	int ht;
+	int ht=0;
 	int64 cycletime;
-	//struct sched_attr attr;
-	//attr.size = sizeof(attr);
-	//sched_fifo(&attr, 40, 0);
+	ec_timet  t_start={0}, t_left={0}, t_end={0};
+	ec_timet cycle_time = { 0,CYCLE_TIME };
 
-	/*clock_gettime(CLOCK_MONOTONIC, &ts);*/
-	ht = (ts.tv_nsec / 1000000) + 1; /* round to nearest ms */
-	ts.tv_nsec = ht * 1000000;
+	t_start = osal_current_time();
 	cycletime = DC_CYCLE_TIME; /* cycletime in ns */
 	toff = 0;
-	//dorun = 0;
-	 /* eseguo il pinning della pagine attuali e future occupate dal thread per garantire
-	//	 prevedibilità nelle prestazioni real-time */
-	//if (mlockall(MCL_CURRENT | MCL_FUTURE) == -1) {
-	//	printf("mlockall failed: %m\n");
-	//	pthread_cancel(pthread_self());
-	//}
 
 	ec_send_processdata();
 
-	//aspetto che il controller setti i parametri nuovi  
-	//dura 1s  
-	while (i) {
-		//add_timespec(&ts, cycletime + toff);
-		//clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, &tleft);
-		osal_usleep(800);
+	while (counter) {
+		osal_usleep(2000);
 		wkc = ec_receive_processdata(EC_TIMEOUTRET);
 		ec_sync(ec_DCtime, cycletime, &toff);
 		ec_send_processdata();
-		i--;
+		counter--;
 	}
 
-	//porta il controller nello stato OPERATION_ENABLED	
-	//dura circa 20 ms
+	// brings the controller into the OPERATION_ENABLED state 
+	// takes about 20 ms
 	while (check != 1) {
-		//add_timespec(&ts, cycletime + toff);
-		//clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, &tleft);
-		osal_usleep(800);
+		osal_usleep(2000);
 		wkc = ec_receive_processdata(EC_TIMEOUTRET);
 		check = Servo_state_machine(MOVE);
 		ec_sync(ec_DCtime, cycletime, &toff);
 		ec_send_processdata();
 	}
 
-	i = 0;
+	counter = 0;
 
-	//fornisce tutti i riferimenti della traiettoria
-	//dura CAMPIONI*1ms
-	while (i < SAMPLES)
+	// provides all references of the trajectory // lasts SAMPLES * 1ms
+	t_start = osal_current_time();
+	t_end = t_start; 
+	while (counter < NUM_OF_SAMPLES)
 	{
 		time1 = ec_DCtime;
 		// calculate next cycle start 
-		//add_timespec(&ts, cycletime + toff);
+		// add_timespec(&ts, cycletime + toff);
 		// wait to cycle start 
+		//TIMER_ADD(&t_start, &cycle_time,&t_start);
 		//clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, &tleft);
 		//if (dorun>0)
-		//{
-		osal_usleep(800);
+		osal_time_diff(&t_start, &t_end, &t_left);
+		t_start = osal_current_time();
+		// important sleep parameter effects all sync
+		if (t_left.usec < 2000) {
+			osal_usleep((2000 - t_left.usec));
+		}
+		else
+		{
+			osal_usleep(2000);
+		}
 		wkc = ec_receive_processdata(EC_TIMEOUTRET);
 		//calcola toff per sincronizzare il master e l'orologio DC 
 		ec_sync(ec_DCtime, cycletime, &toff);
 		check = Servo_state_machine(MOVE);
-		if (check) {
-			actual_position_vals[i] = in_EPOS->position_actual_value;
-			actaul_current_vals[i] = in_EPOS->current_actual_value;
-			current_rpm_vals[i] = in_EPOS->velocity_actual_value;
-			actual_torque_vals[i] = in_EPOS->torque_actual_value;
-			tv[i] = ec_DCtime;
-			out_EPOS->target_position = target_position_abs[i];
+		if (TRUE) {
+			actual_position_vals[counter] = in_EPOS->position_actual_value;
+			actaul_current_vals[counter] = in_EPOS->current_actual_value;
+			current_rpm_vals[counter] = in_EPOS->velocity_actual_value;
+			actual_torque_vals[counter] = in_EPOS->torque_actual_value;
+			tv[counter] = ec_DCtime;
+			out_EPOS->target_position = target_position_abs[counter];
 			ec_send_processdata();
 			time2 = ec_DCtime;
 			cycle = time2 - time1;
-			cycles[i] = cycle;
-			i++;
+			cycles[counter] = cycle;
+			counter++;
 		}
 		else {
-			exit(-1);
+			printf("All samples collected, exiting thread... \n");
+			return;
 		}
-		//}
+		t_end = osal_current_time();
 	}
 
-	//i=CAMPIONI
-	//eseguo il ciclo per fermarmi nella posizione finale 
-	//dura al massimo 15-20 ms 
-	while ((in_EPOS->position_actual_value <= (target_position_abs[SAMPLES - 1] - TRESHOLD + out_EPOS->position_offset)) ||
-		(in_EPOS->position_actual_value >= (target_position_abs[SAMPLES - 1] + TRESHOLD + out_EPOS->position_offset))) {
+	// counter=NUM_OF_SAMPLES
+	// Cycle to stop at final position
+	// Takes about 15-20ms
+	t_start = osal_current_time();
+	t_end = t_start; 
+	while ((in_EPOS->position_actual_value <= (target_position_abs[NUM_OF_SAMPLES - 1] - TRESHOLD + out_EPOS->position_offset)) ||
+		(in_EPOS->position_actual_value >= (target_position_abs[NUM_OF_SAMPLES - 1] + TRESHOLD + out_EPOS->position_offset))) {
 
-		//add_timespec(&ts, cycletime + toff);
-		osal_usleep(800);
+		//TIMER_ADD(&T_START, &CYCLE_TIME, &T_START);
+		osal_time_diff(&t_start, &t_end, &t_left);
+		t_start = osal_current_time();
+		// important sleep parameter effects all sync operation
+		if (t_left.usec < 2000) {
+			osal_usleep((2000 - t_left.usec));
+		}
+		else
+		{
+			osal_usleep(2000);
+		}
 		wkc = ec_receive_processdata(EC_TIMEOUTRET);
 		ec_sync(ec_DCtime, cycletime, &toff);
 		check = Servo_state_machine(MOVE);
 		if (check) {
-			actual_position_vals[i] = in_EPOS->position_actual_value;
-			actaul_current_vals[i] = in_EPOS->current_actual_value;
-			current_rpm_vals[i] = in_EPOS->velocity_actual_value;
-			actual_torque_vals[i] = in_EPOS->torque_actual_value;
-			target_position_abs[i] = target_position_abs[SAMPLES - 1];
-			tv[i] = ec_DCtime;
-			out_EPOS->target_position = target_position_abs[SAMPLES - 1];
+			actual_position_vals[counter] = in_EPOS->position_actual_value;
+			actaul_current_vals[counter] = in_EPOS->current_actual_value;
+			current_rpm_vals[counter] = in_EPOS->velocity_actual_value;
+			actual_torque_vals[counter] = in_EPOS->torque_actual_value;
+			target_position_abs[counter] = target_position_abs[NUM_OF_SAMPLES - 1];
+			tv[counter] = ec_DCtime;
+			out_EPOS->target_position = target_position_abs[NUM_OF_SAMPLES - 1];
 			ec_send_processdata();
-			i++;
+			counter++;
 		}
 
 		else {
-			exit(-1);
+			printf("Cycle stop, exiting thread... \n");
+			return;
 		}
+		t_end = osal_current_time();
 	}
-	//ritardo la cessazione dell'azione di controllo per dare tempo all'asse 
-	//di tornare nella posizione finale corretta
-	//dura .5s
+
 	int j = 500;
 	while (j) {
-		//add_timespec(&ts, cycletime + toff);
-		osal_usleep(800);
+		//TIMER_ADD(&t_start, &cycle_time, &t_start);
+		osal_usleep(2000);
 		wkc = ec_receive_processdata(EC_TIMEOUTRET);
 		ec_sync(ec_DCtime, cycletime, &toff);
 		ec_send_processdata();
@@ -607,22 +636,22 @@ OSAL_THREAD_FUNC ecatthread() {
 	}
 
 	//add_timespec(&ts, cycletime + toff);
-	osal_usleep(800);
+	osal_usleep(2000);
 	ec_sync(ec_DCtime, cycletime, &toff);
-	Servo_state_machine(STOP); //porto il controller nello stato iniziale
+	Servo_state_machine(STOP); // Bring controller initial state
 	ec_send_processdata();
 	wkc = ec_receive_processdata(EC_TIMEOUTRET);
 
 	//add_timespec(&ts, cycletime + toff);
-	osal_usleep(800);
+	osal_usleep(2000);
 	ec_sync(ec_DCtime, cycletime, &toff);
 
-	ec_slave[0].state = EC_STATE_INIT; //imposto lo stato inziale per l'ESM
+	ec_slave[0].state = EC_STATE_INIT; // Bring slaves to init state.
 	ec_writestate(0);
 	ec_statecheck(0, EC_STATE_INIT, 5 * EC_TIMEOUTSTATE);
 
-	ec_dcsync0(EPOS4, FALSE, 0, 0); //disattivo SYNC0
-	ec_close();  //chiudo la connessione
+	ec_dcsync0(EPOS4, FALSE, 0, 0); // deactivate SYNC0
+	ec_close();  // close connection
 	shutdown_ = 0;
 
 }
@@ -630,14 +659,14 @@ OSAL_THREAD_FUNC ecatthread() {
 
 OSAL_THREAD_FUNC CSP_test(char* ifname) {
 	int cnt;
-
+	int print_count = 1000;
 	printf("Starting Redundant test\n");
 
-	//inizializza SOEM e lo collega alla porta ifname
+	// initialize SOEM and connect it to the ifname port
 	if (ec_init(ifname))
 	{
 		printf("ec_init on %s succeeded.\n", ifname);
-		//trova e autoconfigura gli salve
+		// Enumerate and init all slaves.
 		if (ec_config_init(FALSE) > 0)
 		{
 			printf("%d slaves found and configured.\n", ec_slavecount);
@@ -646,21 +675,21 @@ OSAL_THREAD_FUNC CSP_test(char* ifname) {
 			ec_writestate(0);
 			ec_statecheck(0, EC_STATE_PRE_OP, EC_TIMEOUTSTATE * 4);
 
-			//quando avviene la transizione PRE_OP->SAFE_OP chiama CSP_EPOSsetup per 
-			//settare i parametri e mappare i PDO 
+			//when the PRE_OP-> SAFE_OP transition takes place call CSP_EPOSsetup to 
+			// set the parameters and map the PDOs
 			ec_slave[EPOS4].PO2SOconfig = CSP_EPOSsetup;
 
-			//configura il meccanismo DC
+			// Configure DC.
 			ec_configdc();
-			//mappa i PDO mappati precedentemente nel buffer locale
+			// map the previously mapped PDOs into the local buffer
 			ec_config_map(&IOmap);
 
-			out_EPOS = (out_EPOSt*)ec_slave[1].outputs; //output del master
-			in_EPOS = (in_EPOSt*)ec_slave[1].inputs;  //input del master
-			//leggi la posizione iniziale attuale per iniziare il movimento assumendo questa come 0
-			//out_EPOS->position_offset = position_offset + deg_to_inc((double)AMPIEZZA);
+			out_EPOS = (out_EPOSt*)ec_slave[1].outputs; // master commands
+			in_EPOS = (in_EPOSt*)ec_slave[1].inputs;  // slave feedback
+			// read the current starting position to start the movement assuming this as 0
+			//out_EPOS->position_offset = position_offset + deg_to_inc((double)AMPLITUDE);
 
-			//legge e conserva lo stato nel vettore ec_slave[]
+			// read and store the state in the ec_slave [] vector
 			ec_readstate();
 			for (cnt = 1; cnt <= ec_slavecount; cnt++)
 			{
@@ -679,10 +708,10 @@ OSAL_THREAD_FUNC CSP_test(char* ifname) {
 			printf("Request operational state for all slaves\n");
 			ec_slave[0].state = EC_STATE_OPERATIONAL;
 			ec_writestate(0);
-			//crea il thread real-time per lo scambio dati
-			osal_thread_create(&thread1, stack8k * 2, &ecatthread, NULL);
+			// create real-time thread for ecat
+			osal_thread_create_rt(&thread_ecat, stack64k * 2, &ecatthread, NULL);
 			//dorun = 1;
-		   //aspetta che tutti raggiungano OPERATIONAL
+		    // Wait for operational state
 			ec_statecheck(0, EC_STATE_OPERATIONAL, 5 * EC_TIMEOUTSTATE);
 
 			if (ec_slave[0].state == EC_STATE_OPERATIONAL)
@@ -692,15 +721,12 @@ OSAL_THREAD_FUNC CSP_test(char* ifname) {
 				//ciclo per stampare i dati in tempo reale
 				while (shutdown_)
 				{
-					//printf("PDO n.i=%d,target_position=%d,cycle1=,cycle2=%d \n",
-					//	i, out_EPOS->target_position + out_EPOS->position_offset, cycle, ec_slave[1].DCcycle);
+					printf("PDO n.i=%d,target_position=%d,cycle1=%I64d,cycle2=%d \n",
+						counter, out_EPOS->target_position + out_EPOS->position_offset, cycle, ec_slave[1].DCcycle);
 
 					printf("statusword %4x,controlword %x, position_actual_value %d\n",
 						in_EPOS->statusword, out_EPOS->controlword, in_EPOS->position_actual_value);
-
-
-					//fflush(stdout);
-					osal_usleep(800);
+					osal_usleep(500000);
 				}
 				//dorun = 0;
 				inOP = FALSE;
@@ -724,7 +750,7 @@ OSAL_THREAD_FUNC CSP_test(char* ifname) {
 			printf("No slaves found!\n");
 		}
 		printf("End CSP test, close socket\n");
-
+		exit(-1);
 	}
 	else
 	{
@@ -806,7 +832,7 @@ OSAL_THREAD_FUNC ecatcheck() {
 			if (!ec_group[currentgroup].docheckstate)
 				printf("OK : all slaves resumed OPERATIONAL.\n");
 		}
-		osal_usleep(10000);
+		osal_usleep(200000);
 	}
 }
 
@@ -816,31 +842,36 @@ int main(int argc, char* argv[]) {
 
 	printf("SOEM (Simple Open EtherCAT Master)\nCSP test\n");
 
-
 		//dorun = 0;
 		double t = 0;   //tempo in secondi
 		double f = 3;  //frequenza in Hz
-
-		for (int j = 0; j < SAMPLES; j++) {
-			target_position_abs[j] = deg_to_inc(-((double)AMPLITUDE) * cos(2 * PI * f * t));
-			//target_position_abs[j]=deg_to_inc(((double)AMPIEZZA)*sin(2*PI*f*t));
-			//target_position_abs[j]=deg_to_inc(AMPIEZZA);
-			t += STEP;
+		int rotation = 0;
+		const double counter = g_IncPerRotation*2 / NUM_OF_SAMPLES;
+		target_position_abs[0] = 0;
+		for (int j = 1; j < NUM_OF_SAMPLES; j++) {
+			//target_position_abs[j] = deg_to_inc(-((double)AMPLITUDE) * cos(2 * PI * f * t));
+			//target_position_abs[j]=deg_to_inc(((double)AMPLITUDE)*sin(2*PI*f*t));
+			if (!rotation) {
+				target_position_abs[j] = target_position_abs[j-1]+(int32)counter;
+				if (target_position_abs[j] > g_IncPerRotation)
+					rotation = 1;
+			}
+			else
+			{
+				target_position_abs[j] = target_position_abs[j - 1] - (int32)counter;
+				if (target_position_abs[j] < 0)
+					rotation = 0;
+			}
 		}
-
 		/* create RT thread */
 		 //osal_thread_create(&thread1, stack8k * 2, &ecatthread, NULL);
-
 		  /* create thread to handle slave error handling in OP */
-		osal_thread_create(&thread2, stack8k * 4, &ecatcheck, NULL);
+		osal_thread_create(&thread_ecatcheck, stack8k * 4, &ecatcheck, NULL);
+		osal_thread_create_rt(&thread_csptest, stack8k * 4, &CSP_test, ifbuf);
 
 		/* start acyclic part */
-		/*osal_thread_create(&thread3, stack64k * 4, &CSP_test, argv[1]);
-		pthread_join(thread1,NULL);*/
-		CSP_test(ifbuf);
 
-
-		osal_usleep(10000000);
+		osal_usleep(60000000);
 	//	FILE* fposizione, * fcicli, * fcorrente, * fp;
 
 	//	fposizione = fopen("posizione.txt", "wt");
