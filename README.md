@@ -1,1 +1,1 @@
-SOEM-TESTS-WIN10
+SOEM Library tests on Windows 10
